@@ -47,6 +47,17 @@ create table if not exists public.atlas_trip_invites (
 alter table public.atlas_trip_invites
   add column if not exists trip_title text not null default '';
 
+create table if not exists public.atlas_share_links (
+  id uuid primary key default gen_random_uuid(),
+  trip_id uuid not null references public.atlas_trips(id) on delete cascade,
+  token uuid not null unique default gen_random_uuid(),
+  role text not null check (role in ('viewer', 'editor')),
+  active boolean not null default true,
+  created_by uuid not null references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  unique (trip_id, role)
+);
+
 create or replace function public.atlas_set_updated_at()
 returns trigger language plpgsql as $$
 begin
@@ -106,15 +117,79 @@ begin
 end;
 $$;
 
-grant usage on schema public to authenticated;
+create or replace function public.atlas_get_share_link(link_token uuid)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  share_link public.atlas_share_links%rowtype;
+  trip public.atlas_trips%rowtype;
+begin
+  select * into share_link from public.atlas_share_links
+  where token = link_token and active = true;
+
+  if not found then
+    raise exception 'This sharing link is unavailable';
+  end if;
+
+  select * into trip from public.atlas_trips where id = share_link.trip_id;
+  return jsonb_build_object(
+    'share_role', share_link.role,
+    'trip', jsonb_build_object(
+      'id', trip.id,
+      'title', trip.title,
+      'destination', trip.destination,
+      'dates', trip.dates,
+      'start_date', trip.start_date,
+      'end_date', trip.end_date,
+      'destination_lat', trip.destination_lat,
+      'destination_lng', trip.destination_lng,
+      'days', trip.days,
+      'places', trip.places,
+      'transport', trip.transport
+    )
+  );
+end;
+$$;
+
+create or replace function public.atlas_join_share_link(link_token uuid)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare
+  share_link public.atlas_share_links%rowtype;
+begin
+  if auth.uid() is null then
+    raise exception 'Sign in is required to join a co-editing link';
+  end if;
+
+  select * into share_link from public.atlas_share_links
+  where token = link_token and active = true and role = 'editor';
+
+  if not found then
+    raise exception 'This co-editing link is unavailable';
+  end if;
+
+  insert into public.atlas_trip_members (trip_id, user_id, role)
+  values (share_link.trip_id, auth.uid(), 'editor')
+  on conflict (trip_id, user_id) do update set role = 'editor';
+
+  return share_link.trip_id;
+end;
+$$;
+
+grant usage on schema public to anon, authenticated;
 grant select, insert, update, delete on public.atlas_trips to authenticated;
 grant select, insert, update, delete on public.atlas_trip_members to authenticated;
 grant select, insert, update, delete on public.atlas_trip_invites to authenticated;
+grant select, insert, update, delete on public.atlas_share_links to authenticated;
+revoke all on function public.atlas_accept_invite(uuid) from public;
+revoke all on function public.atlas_get_share_link(uuid) from public;
+revoke all on function public.atlas_join_share_link(uuid) from public;
 grant execute on function public.atlas_accept_invite(uuid) to authenticated;
+grant execute on function public.atlas_get_share_link(uuid) to anon, authenticated;
+grant execute on function public.atlas_join_share_link(uuid) to authenticated;
 
 alter table public.atlas_trips enable row level security;
 alter table public.atlas_trip_members enable row level security;
 alter table public.atlas_trip_invites enable row level security;
+alter table public.atlas_share_links enable row level security;
 
 drop policy if exists "atlas trips visible to members" on public.atlas_trips;
 create policy "atlas trips visible to members" on public.atlas_trips
@@ -172,6 +247,16 @@ for update to authenticated using (created_by = auth.uid()) with check (created_
 drop policy if exists "atlas owners delete invites" on public.atlas_trip_invites;
 create policy "atlas owners delete invites" on public.atlas_trip_invites
 for delete to authenticated using (created_by = auth.uid());
+
+drop policy if exists "atlas owners manage share links" on public.atlas_share_links;
+create policy "atlas owners manage share links" on public.atlas_share_links
+for all to authenticated using (
+  exists (select 1 from public.atlas_trips t where t.id = trip_id and t.owner_id = auth.uid())
+) with check (
+  created_by = auth.uid() and exists (
+    select 1 from public.atlas_trips t where t.id = trip_id and t.owner_id = auth.uid()
+  )
+);
 
 alter table public.atlas_trips replica identity full;
 do $$
