@@ -117,6 +117,49 @@ begin
 end;
 $$;
 
+create or replace function public.atlas_save_owner_trip(trip_payload jsonb)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare
+  saved_trip_id uuid;
+  client_key text := coalesce(trip_payload->>'client_id', '');
+begin
+  if auth.uid() is null then
+    raise exception 'Sign in is required to save a trip';
+  end if;
+
+  if client_key = '' then
+    raise exception 'A client trip ID is required';
+  end if;
+
+  insert into public.atlas_trips (
+    owner_id, client_id, title, destination, dates, start_date, end_date,
+    destination_lat, destination_lng, days, places, transport
+  ) values (
+    auth.uid(), client_key, coalesce(trip_payload->>'title', '未命名旅遊'),
+    coalesce(trip_payload->>'destination', ''), coalesce(trip_payload->>'dates', ''),
+    nullif(trip_payload->>'start_date', '')::date, nullif(trip_payload->>'end_date', '')::date,
+    nullif(trip_payload->>'destination_lat', '')::double precision,
+    nullif(trip_payload->>'destination_lng', '')::double precision,
+    coalesce(trip_payload->'days', '[1]'::jsonb),
+    coalesce(trip_payload->'places', '[]'::jsonb),
+    coalesce(trip_payload->'transport', '[]'::jsonb)
+  ) on conflict (owner_id, client_id) do update set
+    title = excluded.title,
+    destination = excluded.destination,
+    dates = excluded.dates,
+    start_date = excluded.start_date,
+    end_date = excluded.end_date,
+    destination_lat = excluded.destination_lat,
+    destination_lng = excluded.destination_lng,
+    days = excluded.days,
+    places = excluded.places,
+    transport = excluded.transport
+  returning id into saved_trip_id;
+
+  return saved_trip_id;
+end;
+$$;
+
 create or replace function public.atlas_get_share_link(link_token uuid)
 returns jsonb language plpgsql security definer set search_path = public as $$
 declare
@@ -180,9 +223,11 @@ grant select, insert, update, delete on public.atlas_trip_members to authenticat
 grant select, insert, update, delete on public.atlas_trip_invites to authenticated;
 grant select, insert, update, delete on public.atlas_share_links to authenticated;
 revoke all on function public.atlas_accept_invite(uuid) from public;
+revoke all on function public.atlas_save_owner_trip(jsonb) from public;
 revoke all on function public.atlas_get_share_link(uuid) from public;
 revoke all on function public.atlas_join_share_link(uuid) from public;
 grant execute on function public.atlas_accept_invite(uuid) to authenticated;
+grant execute on function public.atlas_save_owner_trip(jsonb) to authenticated;
 grant execute on function public.atlas_get_share_link(uuid) to anon, authenticated;
 grant execute on function public.atlas_join_share_link(uuid) to authenticated;
 
